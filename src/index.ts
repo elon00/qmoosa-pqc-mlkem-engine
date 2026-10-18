@@ -49,6 +49,14 @@ export interface KeyGenOptions {
    * If omitted, 64 bytes of cryptographically secure randomness are sampled from the OS CSPRNG.
    */
   readonly seed?: Uint8Array;
+  /**
+   * 32-byte seed d for pseudorandom key generation per NIST FIPS 203 Algorithm 16.
+   */
+  readonly seedD?: Uint8Array;
+  /**
+   * 32-byte seed z for implicit rejection per NIST FIPS 203 Algorithm 16.
+   */
+  readonly seedZ?: Uint8Array;
 }
 
 export interface EncapsOptions {
@@ -109,7 +117,17 @@ export class MlKemEngine {
     const noble = getNobleInstance(paramName);
 
     let seed: Uint8Array | undefined;
-    if (options.seed) {
+    if (options.seedD !== undefined || options.seedZ !== undefined) {
+      if (!options.seedD || options.seedD.length !== 32) {
+        throw new Error('INVALID_SEED_LENGTH: ML-KEM key generation seedD must be exactly 32 bytes');
+      }
+      if (!options.seedZ || options.seedZ.length !== 32) {
+        throw new Error('INVALID_SEED_LENGTH: ML-KEM key generation seedZ must be exactly 32 bytes');
+      }
+      seed = new Uint8Array(64);
+      seed.set(options.seedD, 0);
+      seed.set(options.seedZ, 32);
+    } else if (options.seed !== undefined) {
       if (options.seed.length !== 64) {
         throw new Error('INVALID_SEED_LENGTH: ML-KEM key generation seed (d || z) must be exactly 64 bytes');
       }
