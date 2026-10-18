@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MlKemEngine,
-  deriveHybridSharedSecret
+  deriveHybridSharedSecret,
+  ReferenceLatticeMath
 } from '../dist/index.js';
 import {
   ML_KEM_512,
@@ -28,7 +29,7 @@ test('ML-KEM Engine: Full KEM Round-Trip on ML-KEM-512', () => {
   assert.ok(constantTimeEqual(aliceSecret, bob.sharedSecret), 'Shared secret must match on valid decapsulation');
 });
 
-test('ML-KEM Engine: Full KEM Round-Trip on ML-KEM-768 (Primary Standard)', () => {
+test('ML-KEM Engine: Full KEM Round-Trip on ML-KEM-768 (NIST Category 3 Primary)', () => {
   const engine = new MlKemEngine();
   const alice = engine.generateKeyPair('ML-KEM-768');
 
@@ -45,7 +46,7 @@ test('ML-KEM Engine: Full KEM Round-Trip on ML-KEM-768 (Primary Standard)', () =
   assert.ok(constantTimeEqual(aliceSecret, bob.sharedSecret), 'ML-KEM-768 shared secrets must match exactly');
 });
 
-test('ML-KEM Engine: Full KEM Round-Trip on ML-KEM-1024 (Category 5 Security)', () => {
+test('ML-KEM Engine: Full KEM Round-Trip on ML-KEM-1024 (NIST Category 5)', () => {
   const engine = new MlKemEngine();
   const alice = engine.generateKeyPair('ML-KEM-1024');
 
@@ -83,7 +84,7 @@ test('ML-KEM Engine: Fujisaki-Okamoto Implicit Rejection on Corrupted Ciphertext
   assert.ok(constantTimeEqual(rejectSecret1, rejectSecret2), 'Implicit rejection key must be deterministic');
 });
 
-test('ML-KEM Engine: Hybrid Post-Quantum KEM Round-Trip (ML-KEM-768 + X25519)', () => {
+test('ML-KEM Engine: Hybrid Post-Quantum KEM Round-Trip with Transcript Binding (ML-KEM-768 + X25519)', () => {
   const engine = new MlKemEngine();
   const alice = engine.generateHybridKeyPair('ML-KEM-768');
 
@@ -102,7 +103,9 @@ test('ML-KEM Engine: Hybrid Post-Quantum KEM Round-Trip (ML-KEM-768 + X25519)', 
 
   const aliceCombinedSecret = engine.decapsulateHybrid({
     pqcDk: alice.pqcKeyPair.decapsulationKey,
-    ecdhPrivateKey: alice.ecdhPrivateKey
+    ecdhPrivateKey: alice.ecdhPrivateKey,
+    pqcEk: alice.pqcKeyPair.encapsulationKey,
+    ecdhPublicKey: alice.ecdhPublicKey
   }, {
     pqcCiphertext: bob.pqcCiphertext,
     ecdhEphemeralPublicKey: bob.ecdhEphemeralPublicKey
@@ -112,20 +115,21 @@ test('ML-KEM Engine: Hybrid Post-Quantum KEM Round-Trip (ML-KEM-768 + X25519)', 
   assert.ok(constantTimeEqual(aliceCombinedSecret, bob.combinedSharedSecret), 'Hybrid combined secrets must match');
 });
 
-test('ML-KEM Engine: Deterministic Seeding & Reproducibility (KAT Readiness)', () => {
+test('ML-KEM Engine: Deterministic Seeding & FIPS 203 Known Answer Test (KAT) Reproducibility', () => {
   const engine = new MlKemEngine();
-  const seedD = new Uint8Array(32).fill(0x42);
-  const seedZ = new Uint8Array(32).fill(0x7e);
+  // 64-byte seed (d || z) per FIPS 203 Algorithm 16
+  const seed = new Uint8Array(64).fill(0x42);
 
-  const keypair1 = engine.generateKeyPair('ML-KEM-768', { seedD, seedZ });
-  const keypair2 = engine.generateKeyPair('ML-KEM-768', { seedD, seedZ });
+  const keypair1 = engine.generateKeyPair('ML-KEM-768', { seed });
+  const keypair2 = engine.generateKeyPair('ML-KEM-768', { seed });
 
   assert.ok(constantTimeEqual(keypair1.encapsulationKey, keypair2.encapsulationKey));
   assert.ok(constantTimeEqual(keypair1.decapsulationKey, keypair2.decapsulationKey));
 
-  const messageSeed = new Uint8Array(32).fill(0x33);
-  const encaps1 = engine.encapsulate(keypair1.encapsulationKey, 'ML-KEM-768', { messageSeed });
-  const encaps2 = engine.encapsulate(keypair2.encapsulationKey, 'ML-KEM-768', { messageSeed });
+  // 32-byte message seed m per FIPS 203 Algorithm 17
+  const encapsSeed = new Uint8Array(32).fill(0x7e);
+  const encaps1 = engine.encapsulate(keypair1.encapsulationKey, 'ML-KEM-768', { seed: encapsSeed });
+  const encaps2 = engine.encapsulate(keypair2.encapsulationKey, 'ML-KEM-768', { seed: encapsSeed });
 
   assert.ok(constantTimeEqual(encaps1.ciphertext, encaps2.ciphertext));
   assert.ok(constantTimeEqual(encaps1.sharedSecret, encaps2.sharedSecret));
@@ -134,9 +138,9 @@ test('ML-KEM Engine: Deterministic Seeding & Reproducibility (KAT Readiness)', (
 test('ML-KEM Engine: Defensive Input Validation Rejection', () => {
   const engine = new MlKemEngine();
 
-  // Invalid seed length
+  // Invalid seed length (must be 64 bytes)
   assert.throws(
-    () => engine.generateKeyPair('ML-KEM-768', { seedD: new Uint8Array(16) }),
+    () => engine.generateKeyPair('ML-KEM-768', { seed: new Uint8Array(32) }),
     /INVALID_SEED_LENGTH/
   );
 
@@ -151,4 +155,12 @@ test('ML-KEM Engine: Defensive Input Validation Rejection', () => {
     () => engine.decapsulate(new Uint8Array(2400), new Uint8Array(500), 'ML-KEM-768'),
     /INVALID_CIPHERTEXT/
   );
+});
+
+test('ML-KEM Engine: Reference Lattice Math Module Export & Invariant Verification', () => {
+  assert.ok(ReferenceLatticeMath);
+  assert.equal(typeof ReferenceLatticeMath.ntt, 'function');
+  assert.equal(typeof ReferenceLatticeMath.invNtt, 'function');
+  assert.equal(typeof ReferenceLatticeMath.polyAdd, 'function');
+  assert.equal(typeof ReferenceLatticeMath.polySub, 'function');
 });

@@ -1,4 +1,31 @@
-import { randomBytes, diffieHellman, createHmac, generateKeyPairSync, createPrivateKey, createPublicKey } from 'node:crypto';
+/**
+ * QMOOSA Post-Quantum Cryptography Engine
+ * Standards Baseline: NIST FIPS 203 (Module-Lattice-Based Key-Encapsulation Mechanism)
+ * 
+ * IMPORTANT CRYPTOGRAPHIC NOTICE:
+ * 1. Production key encapsulation and decapsulation operations in this engine are powered by
+ *    the established, maintained, and audited `@noble/post-quantum` cryptographic library.
+ * 2. Algorithmic polynomial ring arithmetic, NTT, and Barrett reduction references are retained
+ *    in `reference-lattice-math.ts` strictly for educational and auditing transparency.
+ * 3. This implementation conforms to the NIST FIPS 203 specification. It is NOT FIPS 140-3
+ *    Cryptographic Module Validation Program (CMVP) certified.
+ * 4. Execution within JavaScript / V8 engines cannot guarantee hardware-level constant-time
+ *    execution; runtime JIT compiler optimizations and memory management are non-deterministic.
+ */
+
+import {
+  randomBytes,
+  diffieHellman,
+  createHmac,
+  generateKeyPairSync,
+  createPrivateKey,
+  createPublicKey
+} from 'node:crypto';
+import {
+  ml_kem512,
+  ml_kem768,
+  ml_kem1024
+} from '@noble/post-quantum/ml-kem.js';
 import {
   ML_KEM_768,
   getMlKemParameters,
@@ -13,52 +40,56 @@ import {
   type HybridKemKeyPair,
   type HybridKemEncapsulationResult
 } from '@qmoosa/pqc-mlkem-protocol';
-import {
-  type Poly,
-  ntt,
-  invNtt,
-  multiplyNtt,
-  polyAdd,
-  polySub,
-  prfCBD,
-  sampleUniformPoly,
-  byteEncode12,
-  byteDecode12,
-  compressPoly,
-  decompressPoly,
-  encodeMessage,
-  decodeMessage,
-  H,
-  G,
-  J
-} from './fips203.js';
+
+export * as ReferenceLatticeMath from './reference-lattice-math.js';
 
 export interface KeyGenOptions {
-  readonly seedD?: Uint8Array; // 32 bytes entropy seed d
-  readonly seedZ?: Uint8Array; // 32 bytes rejection seed z
+  /**
+   * 64-byte deterministic seed (d || z) per NIST FIPS 203 Algorithm 16 / CAVP test vectors.
+   * If omitted, 64 bytes of cryptographically secure randomness are sampled from the OS CSPRNG.
+   */
+  readonly seed?: Uint8Array;
 }
 
 export interface EncapsOptions {
-  readonly messageSeed?: Uint8Array; // 32 bytes message seed m (for deterministic KAT vectors)
+  /**
+   * 32-byte deterministic message seed m per NIST FIPS 203 Algorithm 17 / CAVP test vectors.
+   * If omitted, 32 bytes of cryptographically secure randomness are sampled from the OS CSPRNG.
+   */
+  readonly seed?: Uint8Array;
+}
+
+function getNobleInstance(name: MlKemParameterName) {
+  switch (name) {
+    case 'ML-KEM-512':
+      return ml_kem512;
+    case 'ML-KEM-768':
+      return ml_kem768;
+    case 'ML-KEM-1024':
+      return ml_kem1024;
+    default:
+      throw new Error(`UNSUPPORTED_ML_KEM_PARAMETER_SET: ${name}`);
+  }
 }
 
 /**
  * Derives a combined 32-byte shared secret from post-quantum and classical ECDH shared secrets
- * using HKDF-Extract-and-Expand with SHA-256.
+ * using HKDF-Extract-and-Expand (RFC 5869 / NIST SP 800-56C) with SHA-256.
+ * Binds transcript data including peer public keys and domain separation strings.
  */
 export function deriveHybridSharedSecret(
   pqcSharedSecret: Uint8Array,
   ecdhSharedSecret: Uint8Array,
+  transcriptSalt: Uint8Array = new Uint8Array(32),
   contextInfo = 'QMOOSA-PQC-HYBRID-KEM-V1'
 ): Uint8Array {
-  // Combine PQC secret and classical ECDH secret
+  // Input Keying Material: PQC secret || ECDH secret
   const ikm = Buffer.concat([Buffer.from(pqcSharedSecret), Buffer.from(ecdhSharedSecret)]);
-  const salt = Buffer.alloc(32, 0); // Standard fixed salt for KEM combiner
 
-  // HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
-  const prk = createHmac('sha256', salt).update(ikm).digest();
+  // HKDF-Extract: PRK = HMAC-SHA256(salt, IKM)
+  const prk = createHmac('sha256', Buffer.from(transcriptSalt)).update(ikm).digest();
 
-  // HKDF-Expand: OKM = HMAC-Hash(PRK, info || 0x01)
+  // HKDF-Expand: OKM = HMAC-SHA256(PRK, info || 0x01)
   const infoBuffer = Buffer.concat([Buffer.from(contextInfo, 'utf8'), Buffer.from([0x01])]);
   const okm = createHmac('sha256', prk).update(infoBuffer).digest();
 
@@ -67,206 +98,42 @@ export function deriveHybridSharedSecret(
 
 export class MlKemEngine {
   /**
-   * Internal K-PKE Key Generation (FIPS 203 Algorithm 13)
-   */
-  private pkeKeyGen(params: MlKemParameters, d: Uint8Array): {
-    ekPke: Uint8Array;
-    dkPke: Uint8Array;
-    rho: Uint8Array;
-    tHat: Int16Array[];
-    sHat: Int16Array[];
-  } {
-    const k = params.k;
-    const { K: rho, r: sigma } = G(new Uint8Array([...d, k]));
-
-    // Generate matrix A_hat in NTT domain
-    const aHat: Int16Array[][] = [];
-    for (let i = 0; i < k; i++) {
-      aHat[i] = [];
-      for (let j = 0; j < k; j++) {
-        aHat[i][j] = sampleUniformPoly(rho, i, j);
-      }
-    }
-
-    // Sample secret s and error e from centered binomial distribution
-    let nonce = 0;
-    const s: Int16Array[] = [];
-    const sHat: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      s[i] = prfCBD(sigma, nonce++, params.eta1);
-      sHat[i] = ntt(s[i]);
-    }
-
-    const e: Int16Array[] = [];
-    const eHat: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      e[i] = prfCBD(sigma, nonce++, params.eta1);
-      eHat[i] = ntt(e[i]);
-    }
-
-    // t_hat = A_hat * s_hat + e_hat
-    const tHat: Poly[] = [];
-    for (let i = 0; i < k; i++) {
-      let sum: Poly = new Int16Array(256);
-      for (let j = 0; j < k; j++) {
-        sum = polyAdd(sum, multiplyNtt(aHat[i][j], sHat[j]));
-      }
-      tHat[i] = polyAdd(sum, eHat[i]);
-    }
-
-    // ByteEncode_12(t_hat) || rho
-    const ekParts: Uint8Array[] = [];
-    for (let i = 0; i < k; i++) {
-      ekParts.push(byteEncode12(tHat[i]));
-    }
-    const ekPke = new Uint8Array(Buffer.concat([...ekParts.map(p => Buffer.from(p)), Buffer.from(rho)]));
-
-    // ByteEncode_12(s_hat)
-    const dkParts: Uint8Array[] = [];
-    for (let i = 0; i < k; i++) {
-      dkParts.push(byteEncode12(sHat[i]));
-    }
-    const dkPke = new Uint8Array(Buffer.concat(dkParts.map(p => Buffer.from(p))));
-
-    return { ekPke, dkPke, rho, tHat, sHat };
-  }
-
-  /**
-   * Internal K-PKE Encrypt (FIPS 203 Algorithm 14)
-   */
-  private pkeEncrypt(params: MlKemParameters, ekPke: Uint8Array, m: Uint8Array, r: Uint8Array): Uint8Array {
-    const k = params.k;
-    const rho = ekPke.subarray(384 * k, 384 * k + 32);
-
-    // Decode t_hat
-    const tHat: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      tHat[i] = byteDecode12(ekPke, i * 384);
-    }
-
-    // Generate matrix A_hat from rho
-    const aHat: Int16Array[][] = [];
-    for (let i = 0; i < k; i++) {
-      aHat[i] = [];
-      for (let j = 0; j < k; j++) {
-        aHat[i][j] = sampleUniformPoly(rho, i, j);
-      }
-    }
-
-    // Sample y, e1, e2
-    let nonce = 0;
-    const y: Int16Array[] = [];
-    const yHat: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      y[i] = prfCBD(r, nonce++, params.eta1);
-      yHat[i] = ntt(y[i]);
-    }
-
-    const e1: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      e1[i] = prfCBD(r, nonce++, params.eta2);
-    }
-    const e2 = prfCBD(r, nonce++, params.eta2);
-
-    // u = invNTT(A_hat^T * y_hat) + e1
-    const uParts: Uint8Array[] = [];
-    for (let i = 0; i < k; i++) {
-      let sum: Poly = new Int16Array(256);
-      for (let j = 0; j < k; j++) {
-        // A_hat transpose: A_hat[j][i]
-        sum = polyAdd(sum, multiplyNtt(aHat[j][i], yHat[j]));
-      }
-      const uPoly = polyAdd(invNtt(sum), e1[i]);
-      uParts.push(compressPoly(uPoly, params.du));
-    }
-
-    // v = invNTT(t_hat^T * y_hat) + e2 + mu
-    let vSum: Poly = new Int16Array(256);
-    for (let i = 0; i < k; i++) {
-      vSum = polyAdd(vSum, multiplyNtt(tHat[i], yHat[i]));
-    }
-    const mu = encodeMessage(m);
-    const vPoly = polyAdd(polyAdd(invNtt(vSum), e2), mu);
-    const vPart = compressPoly(vPoly, params.dv);
-
-    const ciphertext = new Uint8Array(Buffer.concat([...uParts.map(p => Buffer.from(p)), Buffer.from(vPart)]));
-    return ciphertext;
-  }
-
-  /**
-   * Internal K-PKE Decrypt (FIPS 203 Algorithm 15)
-   */
-  private pkeDecrypt(params: MlKemParameters, dkPke: Uint8Array, c: Uint8Array): Uint8Array {
-    const k = params.k;
-    const duBytes = (256 * params.du) / 8;
-
-    // Decode u
-    const uPolys: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      uPolys[i] = decompressPoly(c, params.du, i * duBytes);
-    }
-
-    // Decode v
-    const vOffset = k * duBytes;
-    const vPoly = decompressPoly(c, params.dv, vOffset);
-
-    // Decode s_hat
-    const sHat: Int16Array[] = [];
-    for (let i = 0; i < k; i++) {
-      sHat[i] = byteDecode12(dkPke, i * 384);
-    }
-
-    // w = v - invNTT(s_hat^T * NTT(u))
-    let sUSum: Poly = new Int16Array(256);
-    for (let i = 0; i < k; i++) {
-      sUSum = polyAdd(sUSum, multiplyNtt(sHat[i], ntt(uPolys[i])));
-    }
-    const w = polySub(vPoly, invNtt(sUSum));
-    return decodeMessage(w);
-  }
-
-  /**
-   * ML-KEM Key Generation (FIPS 203 Algorithm 16)
+   * ML-KEM Key Generation (NIST FIPS 203 Algorithm 16)
+   * Generates encapsulation key (ek) and decapsulation key (dk).
    */
   public generateKeyPair(
     paramName: MlKemParameterName = ML_KEM_768.name,
     options: KeyGenOptions = {}
   ): Readonly<MlKemKeyPair> {
     const params = getMlKemParameters(paramName);
-    const d = options.seedD ? new Uint8Array(options.seedD) : randomBytes(32);
-    const z = options.seedZ ? new Uint8Array(options.seedZ) : randomBytes(32);
+    const noble = getNobleInstance(paramName);
 
-    if (d.length !== 32 || z.length !== 32) {
-      throw new Error('INVALID_SEED_LENGTH: Seeds d and z must each be 32 bytes');
+    let seed: Uint8Array | undefined;
+    if (options.seed) {
+      if (options.seed.length !== 64) {
+        throw new Error('INVALID_SEED_LENGTH: ML-KEM key generation seed (d || z) must be exactly 64 bytes');
+      }
+      seed = options.seed;
+    } else {
+      seed = new Uint8Array(randomBytes(64));
     }
 
-    const { ekPke, dkPke } = this.pkeKeyGen(params, d);
-    const ek = ekPke;
-    const hEk = H(ek);
+    const { publicKey, secretKey } = noble.keygen(seed);
 
-    // dk = dkPke || ek || H(ek) || z
-    const dk = new Uint8Array(
-      Buffer.concat([
-        Buffer.from(dkPke),
-        Buffer.from(ek),
-        Buffer.from(hEk),
-        Buffer.from(z)
-      ])
-    );
-
-    if (!validateEncapsulationKey(ek, params) || !validateDecapsulationKey(dk, params)) {
-      throw new Error('INTERNAL_KEY_VALIDATION_FAILURE');
+    if (!validateEncapsulationKey(publicKey, params) || !validateDecapsulationKey(secretKey, params)) {
+      throw new Error('INTERNAL_KEY_VALIDATION_FAILURE: Output key lengths do not match FIPS 203 standard');
     }
 
     return Object.freeze({
-      encapsulationKey: ek,
-      decapsulationKey: dk,
+      encapsulationKey: new Uint8Array(publicKey),
+      decapsulationKey: new Uint8Array(secretKey),
       parameterSet: paramName
     });
   }
 
   /**
-   * ML-KEM Encapsulation (FIPS 203 Algorithm 17)
+   * ML-KEM Encapsulation (NIST FIPS 203 Algorithm 17)
+   * Encapsulates a shared secret using peer encapsulation key (ek).
    */
   public encapsulate(
     ek: Uint8Array,
@@ -275,34 +142,40 @@ export class MlKemEngine {
   ): Readonly<MlKemEncapsulationResult> {
     const params = getMlKemParameters(paramName);
     if (!validateEncapsulationKey(ek, params)) {
-      throw new Error('INVALID_ENCAPSULATION_KEY: Length mismatch for parameter set');
+      throw new Error(`INVALID_ENCAPSULATION_KEY: Length mismatch for parameter set ${paramName} (expected ${params.encapsulationKeyBytes} bytes)`);
     }
 
-    const m = options.messageSeed ? new Uint8Array(options.messageSeed) : randomBytes(32);
-    if (m.length !== 32) {
-      throw new Error('INVALID_MESSAGE_SEED_LENGTH: Message seed m must be 32 bytes');
+    const noble = getNobleInstance(paramName);
+
+    let seed: Uint8Array | undefined;
+    if (options.seed) {
+      if (options.seed.length !== 32) {
+        throw new Error('INVALID_MESSAGE_SEED_LENGTH: ML-KEM encapsulation seed (m) must be exactly 32 bytes');
+      }
+      seed = options.seed;
+    } else {
+      seed = new Uint8Array(randomBytes(32));
     }
 
-    // (K, r) = G(m || H(ek))
-    const hEk = H(ek);
-    const { K, r } = G(new Uint8Array([...m, ...hEk]));
+    const { cipherText, sharedSecret } = noble.encapsulate(ek, seed);
 
-    // c = K-PKE.Encrypt(ek, m, r)
-    const c = this.pkeEncrypt(params, ek, m, r);
-
-    if (!validateCiphertext(c, params)) {
-      throw new Error('INTERNAL_CIPHERTEXT_VALIDATION_FAILURE');
+    if (!validateCiphertext(cipherText, params)) {
+      throw new Error('INTERNAL_CIPHERTEXT_VALIDATION_FAILURE: Ciphertext length mismatch');
     }
 
     return Object.freeze({
-      ciphertext: c,
-      sharedSecret: new Uint8Array(K),
+      ciphertext: new Uint8Array(cipherText),
+      sharedSecret: new Uint8Array(sharedSecret),
       parameterSet: paramName
     });
   }
 
   /**
-   * ML-KEM Decapsulation with Fujisaki-Okamoto Implicit Rejection (FIPS 203 Algorithm 18)
+   * ML-KEM Decapsulation (NIST FIPS 203 Algorithm 18)
+   * Decapsulates ciphertext using decapsulation key (dk).
+   * Implements Fujisaki-Okamoto implicit rejection: corrupted or tampered ciphertexts
+   * deterministically return a pseudorandom key derived from dk's rejection seed z,
+   * without throwing exceptions or leaking decapsulation status.
    */
   public decapsulate(
     dk: Uint8Array,
@@ -311,44 +184,19 @@ export class MlKemEngine {
   ): Uint8Array {
     const params = getMlKemParameters(paramName);
     if (!validateDecapsulationKey(dk, params)) {
-      throw new Error('INVALID_DECAPSULATION_KEY: Length mismatch for parameter set');
+      throw new Error(`INVALID_DECAPSULATION_KEY: Length mismatch for parameter set ${paramName} (expected ${params.decapsulationKeyBytes} bytes)`);
     }
     if (!validateCiphertext(ciphertext, params)) {
-      throw new Error('INVALID_CIPHERTEXT: Length mismatch for parameter set');
+      throw new Error(`INVALID_CIPHERTEXT: Length mismatch for parameter set ${paramName} (expected ${params.ciphertextBytes} bytes)`);
     }
 
-    const k = params.k;
-    const dkPkeLen = 384 * k;
-    const ekLen = params.encapsulationKeyBytes;
-
-    const dkPke = dk.subarray(0, dkPkeLen);
-    const ek = dk.subarray(dkPkeLen, dkPkeLen + ekLen);
-    const hEk = dk.subarray(dkPkeLen + ekLen, dkPkeLen + ekLen + 32);
-    const z = dk.subarray(dkPkeLen + ekLen + 32, dkPkeLen + ekLen + 64);
-
-    // Decrypt to get candidate message m'
-    const mPrime = this.pkeDecrypt(params, dkPke, ciphertext);
-
-    // Re-encrypt: (K', r') = G(m' || hEk)
-    const { K: kPrime, r: rPrime } = G(new Uint8Array([...mPrime, ...hEk]));
-    const cPrime = this.pkeEncrypt(params, ek, mPrime, rPrime);
-
-    // Pseudorandom reject key: K_rej = J(z || c)
-    const kRej = J(new Uint8Array([...z, ...ciphertext]), 32);
-
-    // Constant-time check: if c == c' return K', else return K_rej (Implicit Rejection)
-    const isValid = constantTimeEqual(ciphertext, cPrime);
-    const finalSharedSecret = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) {
-      // Branch-free select
-      finalSharedSecret[i] = isValid ? kPrime[i] : kRej[i];
-    }
-
-    return finalSharedSecret;
+    const noble = getNobleInstance(paramName);
+    const sharedSecret = noble.decapsulate(ciphertext, dk);
+    return new Uint8Array(sharedSecret);
   }
 
   /**
-   * Generate Hybrid KeyPair (ML-KEM-768 + X25519)
+   * Generates a hybrid keypair combining post-quantum ML-KEM and classical X25519 (ECDH)
    */
   public generateHybridKeyPair(paramName: MlKemParameterName = ML_KEM_768.name): Readonly<HybridKemKeyPair> {
     const pqcKeyPair = this.generateKeyPair(paramName);
@@ -369,7 +217,8 @@ export class MlKemEngine {
   }
 
   /**
-   * Encapsulate Hybrid Key (ML-KEM + X25519)
+   * Encapsulates a hybrid secret combining post-quantum ML-KEM and classical X25519
+   * with transcript binding over peer public keys.
    */
   public encapsulateHybrid(
     hybridPublicKey: { pqcEk: Uint8Array; ecdhPublicKey: Uint8Array },
@@ -377,17 +226,17 @@ export class MlKemEngine {
   ): Readonly<HybridKemEncapsulationResult> {
     const { pqcEk, ecdhPublicKey } = hybridPublicKey;
 
-    // 1. PQC encapsulation
+    // 1. Post-Quantum encapsulation
     const pqcRes = this.encapsulate(pqcEk, paramName);
 
-    // 2. Generate ephemeral X25519 keypair
+    // 2. Ephemeral classical X25519 generation
     const { publicKey: ephPubDer, privateKey: ephPrivDer } = generateKeyPairSync('x25519', {
       publicKeyEncoding: { type: 'spki', format: 'der' },
       privateKeyEncoding: { type: 'pkcs8', format: 'der' }
     });
     const ephPub = ephPubDer.subarray(ephPubDer.length - 32);
 
-    // 3. Classical ECDH shared secret
+    // 3. Classical ECDH computation
     const bobPubSpki = Buffer.concat([
       Buffer.from('302a300506032b656e032100', 'hex'),
       Buffer.from(ecdhPublicKey)
@@ -397,10 +246,18 @@ export class MlKemEngine {
       publicKey: createPublicKey({ key: bobPubSpki, format: 'der', type: 'spki' })
     });
 
-    // 4. Combine secrets via HKDF-SHA256
+    // 4. Transcript salt binds peer public keys to eliminate key-compromise impersonation
+    const transcriptSalt = Buffer.concat([
+      Buffer.from(pqcEk.subarray(0, 32)),
+      Buffer.from(ecdhPublicKey)
+    ]);
+
+    // 5. Derive combined shared secret via HKDF-SHA256
     const combinedSharedSecret = deriveHybridSharedSecret(
       pqcRes.sharedSecret,
-      new Uint8Array(classicalSecret)
+      new Uint8Array(classicalSecret),
+      new Uint8Array(transcriptSalt),
+      `QMOOSA-PQC-HYBRID-KEM:${paramName}`
     );
 
     return Object.freeze({
@@ -412,20 +269,21 @@ export class MlKemEngine {
   }
 
   /**
-   * Decapsulate Hybrid Key (ML-KEM + X25519)
+   * Decapsulates a hybrid secret using post-quantum ML-KEM and classical X25519
+   * with transcript binding verification.
    */
   public decapsulateHybrid(
-    hybridPrivateKey: { pqcDk: Uint8Array; ecdhPrivateKey: Uint8Array },
+    hybridPrivateKey: { pqcDk: Uint8Array; ecdhPrivateKey: Uint8Array; pqcEk?: Uint8Array; ecdhPublicKey?: Uint8Array },
     hybridCiphertext: { pqcCiphertext: Uint8Array; ecdhEphemeralPublicKey: Uint8Array },
     paramName: MlKemParameterName = ML_KEM_768.name
   ): Uint8Array {
     const { pqcDk, ecdhPrivateKey } = hybridPrivateKey;
     const { pqcCiphertext, ecdhEphemeralPublicKey } = hybridCiphertext;
 
-    // 1. PQC decapsulation (with FO implicit rejection)
+    // 1. Post-Quantum decapsulation (with FO implicit rejection)
     const pqcSecret = this.decapsulate(pqcDk, pqcCiphertext, paramName);
 
-    // 2. Classical ECDH decapsulation
+    // 2. Classical ECDH computation
     const bobPrivPkcs8 = Buffer.concat([
       Buffer.from('302e020100300506032b656e04220420', 'hex'),
       Buffer.from(ecdhPrivateKey)
@@ -439,10 +297,30 @@ export class MlKemEngine {
       publicKey: createPublicKey({ key: alicePubSpki, format: 'der', type: 'spki' })
     });
 
-    // 3. Combine secrets via HKDF-SHA256
+    // 3. Transcript salt extraction:
+    // In FIPS 203 dk = dk_pke || ek || H(ek) || z; ek is embedded at offset 384*k
+    const params = getMlKemParameters(paramName);
+    const ekOffset = 384 * params.k;
+    const ekEmbedded = pqcDk.subarray(ekOffset, ekOffset + 32);
+
+    // Derive public key from private key if not explicitly passed
+    let ecdhPub = hybridPrivateKey.ecdhPublicKey;
+    if (!ecdhPub) {
+      const pubDer = createPublicKey(createPrivateKey({ key: bobPrivPkcs8, format: 'der', type: 'pkcs8' })).export({ type: 'spki', format: 'der' });
+      ecdhPub = new Uint8Array(pubDer.subarray(pubDer.length - 32));
+    }
+
+    const transcriptSalt = Buffer.concat([
+      Buffer.from(ekEmbedded),
+      Buffer.from(ecdhPub)
+    ]);
+
+    // 4. Combine secrets via HKDF-SHA256
     return deriveHybridSharedSecret(
       pqcSecret,
-      new Uint8Array(classicalSecret)
+      new Uint8Array(classicalSecret),
+      new Uint8Array(transcriptSalt),
+      `QMOOSA-PQC-HYBRID-KEM:${paramName}`
     );
   }
 }

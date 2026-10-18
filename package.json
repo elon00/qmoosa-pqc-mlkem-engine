@@ -11,6 +11,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@noble/post-quantum": "^0.7.1",
     "@qmoosa/pqc-mlkem-protocol": "file:../qmoosa-pqc-mlkem-protocol"
   },
   "devDependencies": {

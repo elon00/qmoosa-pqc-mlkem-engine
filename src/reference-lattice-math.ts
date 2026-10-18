@@ -1,6 +1,7 @@
 /**
- * NIST FIPS 203 Module-Lattice-Based Key-Encapsulation Mechanism
- * Pure Reference & Production Cryptographic Engine
+ * EDUCATIONAL & ALGORITHMIC REFERENCE ONLY — NOT FOR PRODUCTION ENCRYPTED TRAFFIC
+ * NIST FIPS 203 Module-Lattice Polynomial & NTT Mathematics Reference
+ * Production applications MUST use established, maintained implementations (e.g. @noble/post-quantum).
  */
 
 import { createHash } from 'node:crypto';
