@@ -1,0 +1,32 @@
+{
+  "name": "@qmoosa/pqc-mlkem-engine",
+  "version": "1.0.0",
+  "description": "QMOOSA Post-Quantum Cryptography Engine — NIST FIPS 203 ML-KEM Key Encapsulation, Decapsulation & Hybrid KEM",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test tests/engine.test.mjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@qmoosa/pqc-mlkem-protocol": "file:../qmoosa-pqc-mlkem-protocol"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "typescript": "^5.4.5"
+  },
+  "keywords": [
+    "qmoosa",
+    "pqc",
+    "fips-203",
+    "ml-kem",
+    "kyber",
+    "key-encapsulation",
+    "hybrid-kem",
+    "x25519"
+  ],
+  "author": "elon00",
+  "license": "MIT"
+}
